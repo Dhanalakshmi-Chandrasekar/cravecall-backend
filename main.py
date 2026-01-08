@@ -49,7 +49,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # If you deploy, set BACKEND_PUBLIC_URL to your domain
-BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL", "http://localhost:9002")
+BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL", "https://cravecallcateringbk-hrgjcyd3aeaxc3dz.canadacentral-01.azurewebsites.net")
 
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
@@ -599,4 +599,5 @@ def get_uploaded_file(filename: str):
     if not os.path.exists(fpath):
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(fpath)
+
 
