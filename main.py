@@ -52,7 +52,7 @@ UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
-BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL", "http://localhost:9002")
+BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL", "https://cravecallcateringbk-hrgjcyd3aeaxc3dz.canadacentral-01.azurewebsites.net")
 
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
@@ -684,3 +684,4 @@ def update_me(payload: AccountUpdate):
     )
 
     return {"success": True}
+
