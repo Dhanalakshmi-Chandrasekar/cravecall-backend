@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query, HTTPException, UploadFile, File
+from fastapi import FastAPI, Query, HTTPException, UploadFile, File, Depends
 from pymongo import MongoClient
 from dotenv import load_dotenv
 from datetime import datetime, timezone, date, timedelta
@@ -8,9 +8,12 @@ from uuid import uuid4
 from pydantic import BaseModel, EmailStr
 from typing import Optional, Dict, Any
 from fastapi.staticfiles import StaticFiles
-from fastapi import UploadFile, File
 from fastapi.responses import FileResponse
 import shutil
+
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from passlib.context import CryptContext
+from jose import jwt, JWTError
 
 # ------------------------
 # Load environment
@@ -32,10 +35,11 @@ app = FastAPI(title="Restaurant Dashboard API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5174",
-        "http://127.0.0.1:5174",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
         "http://localhost:3000",
-        "https://black-plant-05c67ce0f.2.azurestaticapps.net"],
+        "https://cravecallcateringbk-hrgjcyd3aeaxc3dz.canadacentral-01.azurewebsites.net",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -48,8 +52,7 @@ UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
-# If you deploy, set BACKEND_PUBLIC_URL to your domain
-BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL", "https://cravecallcateringbk-hrgjcyd3aeaxc3dz.canadacentral-01.azurewebsites.net")
+BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL", "http://localhost:9002")
 
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
@@ -165,40 +168,159 @@ class AccountUpdate(BaseModel):
     email: Optional[EmailStr] = None
 
 # ------------------------
-# Logo Upload Endpoint ✅
+# AUTH / SECURITY  ✅ FIXED (Argon2)
+# ------------------------
+# IMPORTANT: this removes bcrypt 72-byte password limit.
+pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
+bearer_scheme = HTTPBearer()
+
+JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "43200"))  # default 30 days
+
+def password_bytes_len(pw: str) -> int:
+    return len(pw.encode("utf-8"))
+
+def validate_password(pw: str):
+    # Keep your own rules here (argon2 supports long, but we still enforce sanity)
+    if not pw or len(pw) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
+    # Example: cap at 256 bytes (change if you want)
+    if password_bytes_len(pw) > 256:
+        raise HTTPException(status_code=400, detail="Password is too long (max 256 bytes).")
+
+def hash_password(password: str) -> str:
+    # Argon2 hash
+    return pwd_context.hash(password)
+
+def verify_password(password: str, password_hash: str) -> bool:
+    return pwd_context.verify(password, password_hash)
+
+def create_access_token(payload: dict, expires_minutes: int = JWT_EXPIRE_MINUTES) -> str:
+    exp = datetime.now(timezone.utc) + timedelta(minutes=expires_minutes)
+    to_encode = {**payload, "exp": exp}
+    return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def get_current_user(creds: HTTPAuthorizationCredentials = Depends(bearer_scheme)) -> dict:
+    token = creds.credentials
+    try:
+        data = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user_id = data.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        user = users_col.find_one({"user_id": user_id}, {"_id": 0, "password_hash": 0})
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+        return user
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+class RegisterRequest(BaseModel):
+    # Make name optional so frontend can still send only email/password without 422
+    name: Optional[str] = "User"
+    email: EmailStr
+    password: str
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+class AuthResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: Dict[str, Any]
+
+# ------------------------
+# AUTH ROUTES
+# ------------------------
+@app.post("/auth/register", response_model=AuthResponse)
+def register(payload: RegisterRequest):
+    validate_password(payload.password)
+
+    email = payload.email.lower().strip()
+    existing = users_col.find_one({"email": email})
+    if existing:
+        raise HTTPException(status_code=409, detail="Email already registered")
+
+    user_id = uuid4().hex
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    doc = {
+        "user_id": user_id,
+        "name": (payload.name or "User").strip(),
+        "email": email,
+        "password_hash": hash_password(payload.password),
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }
+    users_col.insert_one(doc)
+
+    token = create_access_token({"sub": user_id, "email": email})
+    user_safe = {"user_id": user_id, "name": doc["name"], "email": doc["email"]}
+    return {"access_token": token, "user": user_safe}
+
+@app.post("/auth/login", response_model=AuthResponse)
+def login(payload: LoginRequest):
+    # DO NOT enforce max-72 here anymore; argon2 doesn't have it.
+    # Still enforce minimum (optional)
+    if not payload.password or len(payload.password) < 1:
+        raise HTTPException(status_code=400, detail="Password is required")
+
+    email = payload.email.lower().strip()
+    user = users_col.find_one({"email": email})
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    password_hash = user.get("password_hash") or ""
+    try:
+        ok = verify_password(payload.password, password_hash)
+    except Exception:
+        # If old bcrypt hashes exist, passlib might fail; treat as invalid
+        ok = False
+
+    if not ok:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    token = create_access_token({"sub": user["user_id"], "email": user["email"]})
+    user_safe = {"user_id": user["user_id"], "name": user.get("name", ""), "email": user["email"]}
+    return {"access_token": token, "user": user_safe}
+
+@app.get("/auth/me")
+def me(current_user: dict = Depends(get_current_user)):
+    return current_user
+
+# ------------------------
+# Logo Upload Endpoint ✅ (single endpoint only)
 # ------------------------
 @app.post("/settings/branding/logo")
-def upload_branding_logo(file: UploadFile = File(...)):
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Only image files allowed")
+async def upload_logo(file: UploadFile = File(...)):
+    allowed = {"image/png", "image/jpeg", "image/webp", "image/svg+xml"}
+    if file.content_type not in allowed:
+        raise HTTPException(status_code=400, detail="Unsupported file type")
 
-    ext = os.path.splitext(file.filename or "")[1].lower()
-    if ext not in [".png", ".jpg", ".jpeg", ".webp", ".svg"]:
-        # fallback safe extension
-        ext = ".png"
+    ext = os.path.splitext(file.filename or "")[1] or ".png"
+    fname = f"logo-{uuid4().hex}{ext}"
+    fpath = os.path.join(UPLOAD_DIR, fname)
 
-    filename = f"logo_{uuid4().hex}{ext}"
-    path = os.path.join(UPLOAD_DIR, filename)
+    with open(fpath, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
 
-    # Save file
-    with open(path, "wb") as f:
-        f.write(file.file.read())
+    logo_url = f"{BACKEND_PUBLIC_URL}/uploads/{fname}"
 
-    logo_url = f"{BACKEND_PUBLIC_URL}/uploads/{filename}"
-
-    # Persist directly (so sidebar can load it)
     settings_col.update_one(
         {"restaurant_id": "default"},
-        {
-            "$set": {
-                "branding.logo_url": logo_url,
-                "updated_at": datetime.now(timezone.utc).isoformat()
-            }
-        },
+        {"$set": {"branding.logo_url": logo_url, "updated_at": datetime.now(timezone.utc).isoformat()}},
         upsert=True
     )
 
     return {"success": True, "logo_url": logo_url}
+
+@app.get("/uploads/{filename}")
+def get_uploaded_file(filename: str):
+    fpath = os.path.join(UPLOAD_DIR, filename)
+    if not os.path.exists(fpath):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(fpath)
 
 # ------------------------
 # SEED ORDERS
@@ -532,7 +654,7 @@ def update_settings(payload: SettingsUpdate):
     return {"success": True}
 
 # ------------------------
-# Users /users/me
+# Users /users/me  (your original profile endpoint)
 # ------------------------
 @app.get("/users/me")
 def get_me():
@@ -562,42 +684,3 @@ def update_me(payload: AccountUpdate):
     )
 
     return {"success": True}
-
-
-UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-@app.post("/settings/branding/logo")
-async def upload_logo(file: UploadFile = File(...)):
-    # Basic validation
-    allowed = {"image/png", "image/jpeg", "image/webp", "image/svg+xml"}
-    if file.content_type not in allowed:
-        raise HTTPException(status_code=400, detail="Unsupported file type")
-
-    ext = os.path.splitext(file.filename or "")[1] or ".png"
-    fname = f"logo-{uuid4().hex}{ext}"
-    fpath = os.path.join(UPLOAD_DIR, fname)
-
-    with open(fpath, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    # Serve URL (same backend)
-    logo_url = f"http://127.0.0.1:9002/uploads/{fname}"
-
-    # optionally persist in settings immediately
-    settings_col.update_one(
-        {"restaurant_id": "default"},
-        {"$set": {"branding.logo_url": logo_url, "updated_at": datetime.now(timezone.utc).isoformat()}},
-        upsert=True
-    )
-
-    return {"success": True, "logo_url": logo_url}
-
-@app.get("/uploads/{filename}")
-def get_uploaded_file(filename: str):
-    fpath = os.path.join(UPLOAD_DIR, filename)
-    if not os.path.exists(fpath):
-        raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(fpath)
-
-
