@@ -11,6 +11,8 @@ email-validator
 pydantic[email]
 python-multipart
 passlib
+python-jose
+
 
 
 
