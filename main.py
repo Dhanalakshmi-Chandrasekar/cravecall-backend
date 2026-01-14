@@ -38,7 +38,7 @@ app.add_middleware(
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:3000",
-        "https://black-plant-05c67ce0f.2.azurestaticapps.net/",
+        "https://black-plant-05c67ce0f.2.azurestaticapps.net",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -684,3 +684,4 @@ def update_me(payload: AccountUpdate):
     )
 
     return {"success": True}
+
