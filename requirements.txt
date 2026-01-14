@@ -12,6 +12,9 @@ pydantic[email]
 python-multipart
 passlib
 python-jose
+argon2-cffi
+
+
 
 
 
